@@ -2,6 +2,18 @@
 #include <vector>
 
 
+__global__ void comm_delay_kernel(unsigned long long cycles)
+{
+    unsigned long long start = clock64();
+    while (clock64() - start < cycles) { }
+}
+
+void launch_comm_delay(cudaStream_t stream, unsigned long long cycles)
+{
+    comm_delay_kernel<<<1, 1, 0, stream>>>(cycles);
+}
+
+
 __global__ void do_matmul(float *A, float *B, float *C, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;

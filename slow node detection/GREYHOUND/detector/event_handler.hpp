@@ -26,6 +26,10 @@ enum ProcessRole : int32_t
     ROLE_RECVER = 1,
 };
 
+// Test-only communication fail-slow injection. It remains a no-op unless the
+// delay environment is configured and the temporary toggle file exists.
+void inject_comm_delay(cudaStream_t stream);
+
 struct ProfileResult
 {
     double min_lat, max_lat, avg_lat, std_lat;

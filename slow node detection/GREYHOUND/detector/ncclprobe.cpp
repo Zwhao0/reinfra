@@ -209,6 +209,7 @@ ncclResult_t ncclSend(const void* sendbuff, size_t count, ncclDataType_t datatyp
 
     using func_t = typeof(ncclSend);
     g_status.add_timing_event(NcclNumber::SEND, count, stream);
+    inject_comm_delay(stream);
     auto ret = (*real_func)(sendbuff, count, datatype, peer, comm, stream);
     log_event(sendbuff, nullptr, count, datatype, comm, stream, NcclNumber::SEND, (uint64_t)peer);
     return ret;
@@ -221,6 +222,7 @@ ncclResult_t ncclRecv(void* recvbuff, size_t count, ncclDataType_t datatype,
     RETRIEVE_NCCL_FUNC(ncclRecv);
 
     g_status.add_timing_event(NcclNumber::RECV, count, stream);
+    inject_comm_delay(stream);
     auto ret = (*real_func)(recvbuff, count, datatype, peer, comm, stream);
     log_event(nullptr, recvbuff, count, datatype, comm, stream, NcclNumber::RECV, (uint64_t)peer);
     return ret;

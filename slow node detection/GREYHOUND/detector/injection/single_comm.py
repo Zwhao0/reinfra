@@ -12,6 +12,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tensor-size", type=int, default=100, help="message size in MiB")
     parser.add_argument("--duration", type=float, default=10, help="traffic duration in seconds")
+    parser.add_argument(
+        "--interval", type=float, default=0,
+        help="seconds to wait after each transfer (reduces GPU DMA duty cycle)",
+    )
     parser.add_argument("--logdir", type=str, default="/workspace/Greyhound/trainlog")
     parser.add_argument(
         "--device", type=int, default=None,
@@ -39,8 +43,8 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size != 2 or rank not in (0, 1):
         raise ValueError("single_comm.py requires WORLD_SIZE=2 and RANK=0 or RANK=1")
-    if args.tensor_size <= 0 or args.duration <= 0:
-        raise ValueError("--tensor-size and --duration must be positive")
+    if args.tensor_size <= 0 or args.duration <= 0 or args.interval < 0:
+        raise ValueError("size/duration must be positive and interval must be non-negative")
 
     device_index = args.device
     if device_index is None:
@@ -75,6 +79,8 @@ def main():
                 break
             dist.recv(tensor, src=0)
         transfers += 1
+        if args.interval:
+            time.sleep(args.interval)
     torch.cuda.synchronize(device)
     dist.barrier()
     elapsed = time.monotonic() - start

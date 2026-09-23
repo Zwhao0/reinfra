@@ -67,10 +67,15 @@ class MitigationPlan(object):
         logging.info(f"TP degree: {tp_degree}")
         comm_items = sorted(list(comm_times.items()))
         max_comm_time_per_pp_stage = []
-        for i in range(len(comm_items)):
-            max_comm_time_per_pp_stage.append(
-                max([comm_items[j][1] for j in range(i, i + tp_degree)])
-            )
+        # Consecutive entries belonging to the same pipeline stage form one
+        # tensor-parallel group.  The old sliding window walked past the end
+        # of the list whenever TP degree was greater than one.
+        for i in range(0, len(comm_items), tp_degree):
+            stage_items = comm_items[i:i + tp_degree]
+            if stage_items:
+                max_comm_time_per_pp_stage.append(
+                    max(comm_time for _, comm_time in stage_items)
+                )
         logging.info(f"max_comm_time_per_pp_stage: {max_comm_time_per_pp_stage}")
         return max_comm_time_per_pp_stage
 

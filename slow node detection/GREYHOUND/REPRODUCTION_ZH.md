@@ -4,7 +4,7 @@
 
 ## 1. 当前结论
 
-README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、计算慢节点检测、根因验证和 200 MiB IB/RDMA 通信压测已经跑通。已在主机 2 / GPU0 注入计算退化，GREYHOUND 最终正确定位到 global rank 8，并通过独立计算验证判定根因为 `comp`。`single_comm.py` 的 README 通信注入脚本已修复并通过；S2/S3/S4 暂不作为本阶段验收项。
+README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、计算/通信慢节点检测与根因验证、以及 200 MiB IB/RDMA 通信压测已经跑通。计算退化实验正确定位到主机 2 / GPU0 / global rank 8，输出 `comp`；局部 NCCL 通信延迟实验定位到包含 global rank 0 的通信组，输出 `comm`。S2/S3/S4 暂不作为本阶段验收项。
 
 | README 项目 | 状态 | 说明 |
 |---|---:|---|
@@ -18,6 +18,7 @@ README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、�
 | 双机 pre-check | 通过 | 16 个 rank 完成计算和跨节点通信验证，`precheck_done=1` |
 | ACF 迭代模式与 BOCD 慢速检测 | 通过 | 识别 5-call 重复模式，注入后上报 fail-slow |
 | 双机计算慢节点定位 | 通过 | 主机 2 / GPU0 / global rank 8 定位正确，根因为 `comp` |
+| 双机通信慢节点定位 | 通过 | global rank 0 的通信组 7.215 ms，对照组 0.542 ms，根因为 `comm` |
 | Accuracy Testing | 通过 | 稳定期估算约 171–181 ms，Megatron 实测中位数 174.7 ms |
 | Overhead Measurement | 通过 | detector off/on 短测 324.039/316.248 ms；未观察到明显正开销 |
 | S1 不调整基线 | 通过 | 单机和双机基线训练均已记录 |
@@ -226,6 +227,44 @@ python single_comm.py --tensor-size 200 --duration 5 \
 
 本次两端都成功传输 722 次 200 MiB tensor，持续约 `5.011 s`，计算带宽约 `28.8 GiB/s`。NCCL 日志明确记录 `Using network IBext`，且没有 `vendor err`。这证明通信压测器可用，但它本身只是“拥塞注入器”，不是慢节点定位器；要证明通信慢节点定位，需在 GREYHOUND 训练运行时并发启动它，再检查 global controller 是否输出 `Root cause: comm`及相关通信 clique/rank。
 
+### 双机通信慢节点定位实测
+
+这两台 H800 有多轨 IB。`single_comm.py` 或 CPU-RDMA 同时压满多条链路时，所有 PP stage 几乎等比例变慢；GREYHOUND 的 `comm` 判定条件是“最慢通信组 > 中位数 1.1 倍”，因此需要局部通信退化。按 README 建议的 NCCL-call sleep 方式，仓库现已提供默认关闭的测试开关。
+
+启动双机训练时，两端都增加：
+
+```bash
+GREYHOUND_COMM_DELAY_RANKS=0 GREYHOUND_COMM_DELAY_US=5000 \
+python run_training.py <其余双机参数>
+```
+
+pre-check 完成且训练稳定后，只在主机 1 容器中启用 global rank 0 的通信延迟：
+
+```bash
+touch /tmp/greyhound_comm_delay_enabled
+```
+
+验收日志：
+
+```bash
+grep -E "Computation result|Max times of each communicator|Reason of fail-slow" \
+  trainlog/<本次目录>/global_controller_*.log
+```
+
+本次结果：
+
+- 所有 rank 的 validation GEMM 约为 `25.6 ms`，没有计算慢节点。
+- 包含 global rank 0 的通信组最大延迟 `7.215 ms`；对照 PP stage 为 `0.542 ms`。
+- global controller 输出 `Reason of fail-slow is comm`。
+
+实验后必须关闭开关：
+
+```bash
+rm -f /tmp/greyhound_comm_delay_enabled
+```
+
+原始日志位于本机 `reproduction-data/greyhound-20260923/node{1,2}/readme-two-node-comm-localize-plugin/`。实验中 controller 在 60 秒后自动进入了 S3 分支，但本阶段不验收 S3；容器已重启，Redis 调整状态和延迟开关均已清除。
+
 ## 9. 查看结果
 
 ```bash
@@ -264,6 +303,9 @@ python run_training_dp.py --iter 50 \
 - S2 不均匀 micro-batch 会让各 rank 以不同速度消耗当前 `single` dataloader。此次 1200 次迭代实验在第 1085 次提前抛出 `StopIteration`。定位、validation、S2 和恢复均在此之前完成，但长时间使用 S2 前必须修复动态数据分片或改用经过验证的 cyclic dataloader。
 - S2 期间 Megatron 的 `global batch size` 日志按当前输出 rank 的局部 micro-batch 推算，会显示 192 等值；不能直接当作所有 rank 的真实总和。真实总量应按分配数组之和乘以 micro-batch size 计算。
 - `single_comm.py` 原版把 global rank 当成本机 GPU 索引，并且每轮硬编码发送 1500 次；已修复。若要使用其他 GPU，设置 `LOCAL_RANK` 或传入 `--device`。
+- 多轨网络被均匀压慢时，不会满足当前源码的通信组 10% 相对差异阈值；真实集群中更适合定位单 NIC、单 rank 或单通信组退化。
+- `parse_communication_results()` 原来用滑动索引遍历 TP 组，TP > 1 时会越界；已改为按 TP degree 分组步进。
+- 通信延迟开关只用于可控复现，默认不生效；同时需要环境变量和 `/tmp/greyhound_comm_delay_enabled` 才会启用。
 
 ## 11. 下一步：用于真实集群慢节点定位
 
@@ -273,4 +315,4 @@ python run_training_dp.py --iter 50 \
 2. **校准定位**：在两台机器的不同 GPU 上重复注入，统计正确定位、误报、漏报和检测延迟；并修复动态数据分片。
 3. **受控缓解**：先接入人工确认、checkpoint 和调度器；稳定后才分批开启 micro-batch 调整或重排。所有动作都要有超时、回滚、审计和“一键关闭”。
 
-当前已经证明主机 2 / GPU0 / rank 8 的计算慢节点可以被定位，且 IB 通信拥塞注入器可用。下一步是在训练期间并发运行该注入器，验证 GREYHOUND 能否输出 `Root cause: comm` 并给出正确通信组。S2/S3/S4 暂不作为本阶段验收项。
+当前已经证明主机 2 / GPU0 / rank 8 的计算慢节点可以被定位，也已证明 global rank 0 所在局部通信组的退化可被区分为 `comm`。下一步不再是功能冒烟，而是在真实集群中校准告警阈值、rank→节点→GPU→NIC 映射和误报/漏报。S2/S3/S4 暂不作为本阶段验收项。

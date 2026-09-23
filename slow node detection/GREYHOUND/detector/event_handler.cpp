@@ -2,10 +2,44 @@
 #include "comm.hpp"
 #include "utils.hpp"
 #include "matmul.cuh"
+#include <cstdlib>
+#include <unistd.h>
 
 #define NUM_WARMUP 3
 #define NUM_REPEATS 10
 #define MATRIX_N 4096
+#define COMM_DELAY_TOGGLE "/tmp/greyhound_comm_delay_enabled"
+
+void inject_comm_delay(cudaStream_t stream)
+{
+    const char* ranks_env = std::getenv("GREYHOUND_COMM_DELAY_RANKS");
+    const char* delay_env = std::getenv("GREYHOUND_COMM_DELAY_US");
+    if (ranks_env == nullptr || delay_env == nullptr || access(COMM_DELAY_TOGGLE, F_OK) != 0)
+        return;
+
+    int my_rank = get_rank(DistEngine::auto_find);
+    bool selected = false;
+    std::stringstream ranks(ranks_env);
+    std::string rank_token;
+    while (std::getline(ranks, rank_token, ',')) {
+        if (!rank_token.empty() && std::stoi(rank_token) == my_rank) {
+            selected = true;
+            break;
+        }
+    }
+    if (!selected)
+        return;
+
+    long delay_us = std::strtol(delay_env, nullptr, 10);
+    if (delay_us <= 0)
+        return;
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    unsigned long long cycles = static_cast<unsigned long long>(delay_us) * prop.clockRate / 1000ULL;
+    launch_comm_delay(stream, cycles);
+}
 
 static void parse_task(std::string& task, int* role, int* target_peer, uint64_t* comm_addr)
 {
@@ -39,12 +73,14 @@ ProfileResult p2p_profile_task(
     {
         if (role == (int)ProcessRole::ROLE_SENDER) {
             cudaEventRecord(start, stream);
+            inject_comm_delay(stream);
             ncclResult_t res = send_func(buf, count, ncclInt, peer, comm, stream);
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&duration, start, stop);
         } else if (role == (int)ProcessRole::ROLE_RECVER) {
             cudaEventRecord(start, stream);
+            inject_comm_delay(stream);
             ncclResult_t res = recv_func(buf, count, ncclInt, peer, comm, stream);
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
@@ -57,6 +93,7 @@ ProfileResult p2p_profile_task(
     {
         if (role == (int)ProcessRole::ROLE_SENDER) {
             cudaEventRecord(start, stream);
+            inject_comm_delay(stream);
             ncclResult_t res = send_func(buf, count, ncclInt, peer, comm, stream);
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
@@ -66,6 +103,7 @@ ProfileResult p2p_profile_task(
             //     get_rank(DistEngine::auto_find), peer, comm, 0, duration);
         } else if (role == (int)ProcessRole::ROLE_RECVER) {
             cudaEventRecord(start, stream);
+            inject_comm_delay(stream);
             ncclResult_t res = recv_func(buf, count, ncclInt, peer, comm, stream);
             cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
