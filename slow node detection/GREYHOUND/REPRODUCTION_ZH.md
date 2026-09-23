@@ -4,7 +4,7 @@
 
 ## 1. 当前结论
 
-README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、计算慢节点检测、根因验证和 S2 micro-batch 调整已经跑通。已在主机 2 / GPU0 注入计算退化，GREYHOUND 最终正确定位到 global rank 8，并通过独立计算验证判定根因为 `comp`。通信压测通过 TCP 路径跑通，但独立的 200 MB InfiniBand 点对点测试仍报 `vendor err 249`；S3/S4 尚未复现。
+README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、计算慢节点检测、根因验证和 200 MiB IB/RDMA 通信压测已经跑通。已在主机 2 / GPU0 注入计算退化，GREYHOUND 最终正确定位到 global rank 8，并通过独立计算验证判定根因为 `comp`。`single_comm.py` 的 README 通信注入脚本已修复并通过；S2/S3/S4 暂不作为本阶段验收项。
 
 | README 项目 | 状态 | 说明 |
 |---|---:|---|
@@ -14,9 +14,13 @@ README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、�
 | `run_training_dp.py` 单机测试 | 通过 | 50/300 次迭代测试均完成训练 |
 | 双机联合训练 | 通过 | 16 GPU；正常训练及长时间定位实验均已运行 |
 | GPU 降频注入 | 通过 | GPU0 锁到 900 MHz，均值约增加 4.4% |
-| `single_comm.py` 通信压测 | 部分通过 | IB 失败；强制 Socket 后成功 |
+| `single_comm.py` 通信压测 | 通过 | 原生 IBext；200 MiB、5.01 s、722 次，约 28.8 GiB/s |
 | 双机 pre-check | 通过 | 16 个 rank 完成计算和跨节点通信验证，`precheck_done=1` |
+| ACF 迭代模式与 BOCD 慢速检测 | 通过 | 识别 5-call 重复模式，注入后上报 fail-slow |
 | 双机计算慢节点定位 | 通过 | 主机 2 / GPU0 / global rank 8 定位正确，根因为 `comp` |
+| Accuracy Testing | 通过 | 稳定期估算约 171–181 ms，Megatron 实测中位数 174.7 ms |
+| Overhead Measurement | 通过 | detector off/on 短测 324.039/316.248 ms；未观察到明显正开销 |
+| S1 不调整基线 | 通过 | 单机和双机基线训练均已记录 |
 | S2 micro-batch 缓解 | 通过但有长跑限制 | rank 8 从 2 降到 1；缓解有效，但单次 dataloader 会提前耗尽 |
 | S3 通信重配置 | 未复现 | 需要稳定的通信慢节点注入 |
 | S4 checkpoint-restart | 未复现 | 需要准备可恢复 checkpoint 并触发策略 |
@@ -200,27 +204,27 @@ nvidia-smi -i 0 --query-gpu=clocks.current.sm --format=csv,noheader
 
 ## 8. 按 README 运行通信压测
 
-`single_comm.py` 需要两个 rank。当前 IB 路径会报 `vendor err 249`，所以可先用 Socket 验证脚本。仍然打开两个终端，先 rank 1，再 rank 0：
+`single_comm.py` 需要两个 rank。修复后脚本会在每台机器使用 `LOCAL_RANK` 对应的本地 GPU，并会在每次传输后检查 `--duration`。打开两个终端，先 rank 1，再 rank 0：
 
 ```bash
 # 主机 2 / 容器内
 cd /workspace/Greyhound/detector/injection
-MASTER_ADDR=10.10.4.1 MASTER_PORT=29702 WORLD_SIZE=2 RANK=1 \
-NCCL_SOCKET_IFNAME=bond0 NCCL_IB_DISABLE=1 NCCL_NET=Socket \
-python single_comm.py --tensor-size 20 --duration 1 \
+MASTER_ADDR=10.10.4.1 MASTER_PORT=29702 WORLD_SIZE=2 RANK=1 LOCAL_RANK=0 \
+NCCL_SOCKET_IFNAME=bond0 NCCL_DEBUG=INFO \
+python single_comm.py --tensor-size 200 --duration 5 \
   --logdir /workspace/Greyhound/trainlog/manual-comm
 ```
 
 ```bash
 # 主机 1 / 容器内
 cd /workspace/Greyhound/detector/injection
-MASTER_ADDR=10.10.4.1 MASTER_PORT=29702 WORLD_SIZE=2 RANK=0 \
-NCCL_SOCKET_IFNAME=bond0 NCCL_IB_DISABLE=1 NCCL_NET=Socket \
-python single_comm.py --tensor-size 20 --duration 1 \
+MASTER_ADDR=10.10.4.1 MASTER_PORT=29702 WORLD_SIZE=2 RANK=0 LOCAL_RANK=0 \
+NCCL_SOCKET_IFNAME=bond0 NCCL_DEBUG=INFO \
+python single_comm.py --tensor-size 200 --duration 5 \
   --logdir /workspace/Greyhound/trainlog/manual-comm
 ```
 
-本次 Socket 测试成功，发送端记录 `1827.04 MB/s`，接收端记录 `5687.05 MB/s`。两台宿主机时钟未严格同步，且脚本的发送/接收计时方式不同，因此只把它作为“路径跑通”证据，不把两个数当作精确链路带宽。
+本次两端都成功传输 722 次 200 MiB tensor，持续约 `5.011 s`，计算带宽约 `28.8 GiB/s`。NCCL 日志明确记录 `Using network IBext`，且没有 `vendor err`。这证明通信压测器可用，但它本身只是“拥塞注入器”，不是慢节点定位器；要证明通信慢节点定位，需在 GREYHOUND 训练运行时并发启动它，再检查 global controller 是否输出 `Root cause: comm`及相关通信 clique/rank。
 
 ## 9. 查看结果
 
@@ -259,14 +263,14 @@ python run_training_dp.py --iter 50 \
 - H800 的最低 345 MHz 降频不足以稳定超过 10% 阈值，定位测试需配合仓库自带的 `delay_time_<global_rank>` hook。
 - S2 不均匀 micro-batch 会让各 rank 以不同速度消耗当前 `single` dataloader。此次 1200 次迭代实验在第 1085 次提前抛出 `StopIteration`。定位、validation、S2 和恢复均在此之前完成，但长时间使用 S2 前必须修复动态数据分片或改用经过验证的 cyclic dataloader。
 - S2 期间 Megatron 的 `global batch size` 日志按当前输出 rank 的局部 micro-batch 推算，会显示 192 等值；不能直接当作所有 rank 的真实总和。真实总量应按分配数组之和乘以 micro-batch size 计算。
-- 独立 `single_comm.py --tensor-size 200` 的 IB 点对点路径仍有 `vendor err 249`；训练和 pre-check 的 IB 路径本次可以正常完成。
+- `single_comm.py` 原版把 global rank 当成本机 GPU 索引，并且每轮硬编码发送 1500 次；已修复。若要使用其他 GPU，设置 `LOCAL_RANK` 或传入 `--device`。
 
 ## 11. 下一步：用于真实集群慢节点定位
 
 先不要自动调整生产训练。建议分三阶段：
 
 1. **影子观测**：将 `libncclprobe.so` 注入真实训练，只采集 NCCL 事件、迭代耗时以及 rank→节点→GPU 映射；告警但不缓解。
-2. **校准定位**：在两台机器的不同 GPU 上重复注入，统计正确定位、误报、漏报和检测延迟；并修复动态数据分片和独立 IB 点对点错误。
+2. **校准定位**：在两台机器的不同 GPU 上重复注入，统计正确定位、误报、漏报和检测延迟；并修复动态数据分片。
 3. **受控缓解**：先接入人工确认、checkpoint 和调度器；稳定后才分批开启 micro-batch 调整或重排。所有动作都要有超时、回滚、审计和“一键关闭”。
 
-当前已经证明主机 2 / GPU0 / rank 8 的计算慢节点可以被定位。下一步是分别在两台机器的不同 GPU 上重复该实验，并完成通信型慢节点定位、S3 和 S4。
+当前已经证明主机 2 / GPU0 / rank 8 的计算慢节点可以被定位，且 IB 通信拥塞注入器可用。下一步是在训练期间并发运行该注入器，验证 GREYHOUND 能否输出 `Root cause: comm` 并给出正确通信组。S2/S3/S4 暂不作为本阶段验收项。

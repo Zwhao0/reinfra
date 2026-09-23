@@ -1,59 +1,89 @@
-import os
-import time
-import torch
 import argparse
 import logging
+import os
+import time
+from datetime import datetime, timedelta
+
+import torch
 import torch.distributed as dist
-from datetime import datetime
 
 
-def send_recv(rank, tensor_size = 1024 * 1024 * 25, repeat=1):
-    logging.info(f"[{datetime.now()}] Rank {rank} invoked, tensor_size={tensor_size * 4 / (1024 * 1024)}MB!")
-    send_tensor = torch.randn(tensor_size, device='cuda:0') if rank == 0 else None
-    recv_tensor = torch.empty(tensor_size, device='cuda:1') if rank == 1 else None
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tensor-size", type=int, default=100, help="message size in MiB")
+    parser.add_argument("--duration", type=float, default=10, help="traffic duration in seconds")
+    parser.add_argument("--logdir", type=str, default="/workspace/Greyhound/trainlog")
+    parser.add_argument(
+        "--device", type=int, default=None,
+        help="local CUDA device (default: LOCAL_RANK, or GPU 0 when unset)",
+    )
+    parser.add_argument("--timeout", type=int, default=300)
+    return parser.parse_args()
 
-    if rank == 0:
-        start_time = time.time()
-        for _ in range(repeat):
-            dist.send(send_tensor, dst=1)
-        torch.cuda.synchronize()
-        end_time = time.time()
-        bandwidth = tensor_size * 4 * repeat / (end_time - start_time) / (1024 * 1024)  # MB/s
-        logging.info(f"[{datetime.now()}] Rank {rank} sent data. Bandwidth: {bandwidth:.2f} MB/s")
 
-    if rank == 1:
-        start_time = time.time()
-        for _ in range(repeat):
-            dist.recv(recv_tensor, src=0)
-        torch.cuda.synchronize()
-        end_time = time.time()
-        bandwidth = tensor_size * 4 * repeat / (end_time - start_time) / (1024 * 1024)  # MB/s
-        logging.info(f"[{datetime.now()}] Rank {rank} received data. Bandwidth: {bandwidth:.2f} MB/s")
+def configure_logging(logdir, rank):
+    os.makedirs(logdir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S_%f")
+    logpath = os.path.join(logdir, f"comm_worker_rank{rank}_{stamp}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(logpath), logging.StreamHandler()],
+    )
+    return logpath
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tensor-size", type=int, default=100)
-    parser.add_argument("--duration", type=int, default=10)
-    parser.add_argument("--logdir", type=str, default='/workspace/Megatron-failslow/trainlog/')
-    args = parser.parse_args()
+    args = parse_args()
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size != 2 or rank not in (0, 1):
+        raise ValueError("single_comm.py requires WORLD_SIZE=2 and RANK=0 or RANK=1")
+    if args.tensor_size <= 0 or args.duration <= 0:
+        raise ValueError("--tensor-size and --duration must be positive")
 
-    tensor_size = 1024 * 1024 * (args.tensor_size // 4)
-    time_str = str(datetime.now()).replace(" ", '_').replace('-', '_').replace(':', '_').replace('.', '_')
-    logpath = args.logdir + f"/comm_worker_{time_str}.log"
-    duration = args.duration
+    device_index = args.device
+    if device_index is None:
+        device_index = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(device_index)
+    device = torch.device("cuda", device_index)
+    logpath = configure_logging(args.logdir, rank)
 
-    rank = int(os.getenv("RANK"))
-    world_size = int(os.getenv("WORLD_SIZE"))
-    logging.getLogger().setLevel(logging.INFO)
-    # logging.basicConfig(filename=logpath)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    dist.all_reduce(torch.tensor([1], device=f'cuda:{rank}'))
-    t0 = time.time()
-    running_time = 0
-    while running_time < duration:
-        send_recv(rank, tensor_size=tensor_size, repeat=1500)
-        running_time = time.time() - t0
+    dist.init_process_group(
+        "nccl", rank=rank, world_size=world_size,
+        timeout=timedelta(seconds=args.timeout),
+    )
+    element_size = torch.empty((), dtype=torch.float32).element_size()
+    numel = args.tensor_size * 1024 * 1024 // element_size
+    tensor = torch.randn(numel, device=device) if rank == 0 else torch.empty(numel, device=device)
+
+    dist.all_reduce(torch.ones(1, device=device))
+    dist.barrier()
+    start = time.monotonic()
+    transfers = 0
+    control = torch.ones(1, dtype=torch.int32, device=device)
+    while True:
+        if rank == 0:
+            control.fill_(int(time.monotonic() - start < args.duration))
+            dist.send(control, dst=1)
+            if not control.item():
+                break
+            dist.send(tensor, dst=1)
+        else:
+            dist.recv(control, src=0)
+            if not control.item():
+                break
+            dist.recv(tensor, src=0)
+        transfers += 1
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    elapsed = time.monotonic() - start
+    bandwidth = args.tensor_size * transfers / elapsed
+    logging.info(
+        "rank=%d device=%d transfers=%d tensor_size=%d MiB elapsed=%.3f s bandwidth=%.2f MiB/s log=%s",
+        rank, device_index, transfers, args.tensor_size, elapsed, bandwidth, logpath,
+    )
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
