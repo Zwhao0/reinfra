@@ -100,8 +100,14 @@ class FailslowAwareMicroBatches(ConstantNumMicroBatches):
             self.inited = True
         if self.iter_count % _CHECK_INTERVAL == 0 and self.get_check:
             tmp_mb_num = get_my_micro_batch_num()
-            # Add an all-reduce here to sync micro-batch updates
-            # torch.distributed.all_reduce(torch.tensor([1], device=torch.cuda.current_device()))
+            # The detector recognizes a 503-byte int8 NCCL collective as the
+            # control-plane polling marker (CHECK_PAUSE_MAGIC in ncclprobe.cpp).
+            # Without this marker workers never observe VALIDATE/PROFILE state
+            # changes and the global controller blocks waiting for task ACKs.
+            control_marker = torch.ones(
+                503, dtype=torch.int8, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(control_marker)
             if tmp_mb_num != self.num_micro_batches:
                 logging.info(f"[MicrobatchCalculator] rank {torch.distributed.get_rank()} DP Changed (iter={self.iter_count})")
                 self.num_micro_batches = tmp_mb_num

@@ -1,10 +1,10 @@
 # GREYHOUND 两机复现与使用指南
 
-更新时间：2026-09-23。本指南以项目 `README.md` 为验收标准；论文数字只作辅助参考。
+更新时间：2026-09-23。本指南只以项目 `README.md` 和本机实测结果为验收标准。
 
 ## 1. 当前结论
 
-README 的安装、编译、单机 8-GPU 训练、双机 16-GPU 训练、计算降速注入、日志生成和开销 A/B 测试已经跑通。通信压测通过 TCP 路径跑通，但原生 InfiniBand 点对点测试报 `vendor err 249`。短作业能启动 GREYHOUND 预检并识别 DP clique，但预检没有在作业结束前完成，因此不能声称已经复现自动定位、根因验证及 S2/S3/S4 缓解闭环。
+README 的安装、编译、单机 8-GPU、双机 16-GPU、双机 pre-check、计算慢节点检测、根因验证和 S2 micro-batch 调整已经跑通。已在主机 2 / GPU0 注入计算退化，GREYHOUND 最终正确定位到 global rank 8，并通过独立计算验证判定根因为 `comp`。通信压测通过 TCP 路径跑通，但独立的 200 MB InfiniBand 点对点测试仍报 `vendor err 249`；S3/S4 尚未复现。
 
 | README 项目 | 状态 | 说明 |
 |---|---:|---|
@@ -12,12 +12,14 @@ README 的安装、编译、单机 8-GPU 训练、双机 16-GPU 训练、计算�
 | detector `.so` 与 controller wheel | 通过 | 两台机器均已编译 |
 | `run_training.py` 单机测试 | 通过 | 两机分别 3 次迭代 |
 | `run_training_dp.py` 单机测试 | 通过 | 50/300 次迭代测试均完成训练 |
-| 双机联合训练 | 通过 | 16 GPU、100 次迭代完成 |
+| 双机联合训练 | 通过 | 16 GPU；正常训练及长时间定位实验均已运行 |
 | GPU 降频注入 | 通过 | GPU0 锁到 900 MHz，均值约增加 4.4% |
 | `single_comm.py` 通信压测 | 部分通过 | IB 失败；强制 Socket 后成功 |
-| 预检、自动定位和根因验证 | 未完整通过 | 短作业结束时仍在等待 pre-check |
-| S2/S3/S4 自动缓解 | 未复现 | 需要先解决预检和 IB，再运行更长作业 |
-| 论文规模准确率/吞吐提升 | 未复现 | 我们只有 16 GPU，论文主实验规模和工作负载不同 |
+| 双机 pre-check | 通过 | 16 个 rank 完成计算和跨节点通信验证，`precheck_done=1` |
+| 双机计算慢节点定位 | 通过 | 主机 2 / GPU0 / global rank 8 定位正确，根因为 `comp` |
+| S2 micro-batch 缓解 | 通过但有长跑限制 | rank 8 从 2 降到 1；缓解有效，但单次 dataloader 会提前耗尽 |
+| S3 通信重配置 | 未复现 | 需要稳定的通信慢节点注入 |
+| S4 checkpoint-restart | 未复现 | 需要准备可恢复 checkpoint 并触发策略 |
 
 ## 2. 固定环境
 
@@ -119,6 +121,64 @@ python run_training_dp.py \
 
 两边的 `nnodes`、`master`、`master-port` 必须相同，`rank` 必须分别为 0 和 1。本次实测第 20–100 次迭代均值为 `186.394 ms`，约 `321.90 iter/min`。
 
+### 双机 rank 映射
+
+每台机器由 `torchrun --nproc-per-node 8` 启动 8 个进程，因此：
+
+```text
+global_rank = node_rank * 8 + local_gpu_id
+```
+
+| 机器 | node rank | global rank | GPU |
+|---|---:|---:|---:|
+| 主机 1 / `10.10.4.1` | 0 | 0–7 | 0–7 |
+| 主机 2 / `10.10.4.2` | 1 | 8–15 | 0–7 |
+
+因此主机 2 / GPU0 对应 global rank 8。
+
+### 双机计算慢节点定位实测
+
+双机训练和 `precheck_done=1` 后，在主机 2 宿主机执行：
+
+```bash
+sudo nvidia-smi -i 0 -lgc 345
+```
+
+由于 H800 的最低硬件频率只造成约 5%–6% 退化，低于代码的 10% 检测阈值，本次还使用仓库自带的模型 hook。在主机 1 容器中执行：
+
+```bash
+redis-cli -h 10.10.4.1 set delay_time_8 0.1
+```
+
+实测结果：
+
+- local controller 报告 rank 8 发生 fail-slow；其他 rank 也会因同步等待产生连带上报。
+- validation 中 rank 8 的计算时间为 `144.192 ms`，其余 rank 为约 `25.6–25.8 ms`。
+- global controller 输出 `Reason of fail-slow is comp`。
+- S2 计划为 `[2,2,2,2,2,2,2,2,1,2,2,2,2,2,2,3]`，即减少 rank 8、增加 rank 15。
+- 正常阶段中位数 `174.7 ms`；注入后、缓解前 `445.0 ms`；S2 后 `257.9 ms`；完全恢复后 `174.8 ms`。
+
+恢复命令必须全部执行：
+
+```bash
+# 主机 1 容器内
+redis-cli -h 10.10.4.1 set delay_time_8 0
+redis-cli -h 10.10.4.1 set batch_distribution \
+  '[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]'
+redis-cli -h 10.10.4.1 set dp_version 2
+
+# 主机 2 宿主机
+sudo nvidia-smi -i 0 -rgc
+```
+
+本次原始日志位于本机：
+
+```text
+/Users/henry/Desktop/故障定位和恢复/reproduction-data/greyhound-20260923/
+  node1/readme-two-node-localize/
+  node2/readme-two-node-localize/
+```
+
 ## 7. 按 README 注入计算慢节点
 
 先让训练稳定运行，再在宿主机的另一个 SSH 终端执行：
@@ -191,19 +251,22 @@ python run_training_dp.py --iter 50 \
   --master-port 29621 --logdir /workspace/Greyhound/trainlog/overhead-on
 ```
 
-本次短测 detector off/on 均值分别为 `324.039/316.248 ms`，表观开销 `-2.40%`。这是短测噪声，不代表 detector 会加速；只能说明没有观察到明显正开销。论文报告平均跟踪开销约 `0.39%`、最高 `1.1%`，我们的样本不足以验证该精确数字。
+本次短测 detector off/on 均值分别为 `324.039/316.248 ms`，表观开销 `-2.40%`。这是短测噪声，不代表 detector 会加速；只能说明没有观察到明显正开销。
 
-## 10. 论文数据只作辅助参照
+## 10. 当前已知限制
 
-论文报告生产数据 499 个作业中 498 个定位正确、跟踪平均开销约 0.39%，以及缓解后相对“不处理”约 1.58 倍吞吐。论文使用最多 256 张 H800 和不同工作负载；我们的 16-GPU 短测没有测定位准确率或 S2/S3/S4，因此不应宣称结果与论文等价。参考：[USENIX 论文页面](https://www.usenix.org/conference/atc25/presentation/wu-tianyuan)；[论文 PDF](https://www.usenix.org/system/files/atc25-wu-tianyuan.pdf)。
+- 变更后的 503-byte NCCL 控制标记是 pre-check 能运行的必要修复；两台服务器必须使用同一版本的 `microbatches.py`。
+- H800 的最低 345 MHz 降频不足以稳定超过 10% 阈值，定位测试需配合仓库自带的 `delay_time_<global_rank>` hook。
+- S2 不均匀 micro-batch 会让各 rank 以不同速度消耗当前 `single` dataloader。此次 1200 次迭代实验在第 1085 次提前抛出 `StopIteration`。定位、validation、S2 和恢复均在此之前完成，但长时间使用 S2 前必须修复动态数据分片或改用经过验证的 cyclic dataloader。
+- S2 期间 Megatron 的 `global batch size` 日志按当前输出 rank 的局部 micro-batch 推算，会显示 192 等值；不能直接当作所有 rank 的真实总和。真实总量应按分配数组之和乘以 micro-batch size 计算。
+- 独立 `single_comm.py --tensor-size 200` 的 IB 点对点路径仍有 `vendor err 249`；训练和 pre-check 的 IB 路径本次可以正常完成。
 
 ## 11. 下一步：用于真实集群慢节点定位
 
 先不要自动调整生产训练。建议分三阶段：
 
 1. **影子观测**：将 `libncclprobe.so` 注入真实训练，只采集 NCCL 事件、迭代耗时以及 rank→节点→GPU 映射；告警但不缓解。
-2. **校准定位**：先修复 IB `vendor err 249` 和单机预检耗时问题，在长作业中人为降频、限带宽，验证能稳定指出正确节点/GPU，并统计误报、漏报、检测延迟和开销。
+2. **校准定位**：在两台机器的不同 GPU 上重复注入，统计正确定位、误报、漏报和检测延迟；并修复动态数据分片和独立 IB 点对点错误。
 3. **受控缓解**：先接入人工确认、checkpoint 和调度器；稳定后才分批开启 micro-batch 调整或重排。所有动作都要有超时、回滚、审计和“一键关闭”。
 
-离真实上线最近的下一个实验是：双机运行 30–60 分钟的固定训练，在完成 pre-check 后只降频一张 GPU，确认 `global_controller_*.log` 能报告正确 rank，并在恢复频率后回到正常状态。
-
+当前已经证明主机 2 / GPU0 / rank 8 的计算慢节点可以被定位。下一步是分别在两台机器的不同 GPU 上重复该实验，并完成通信型慢节点定位、S3 和 S4。
