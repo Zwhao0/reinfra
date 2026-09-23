@@ -93,17 +93,20 @@ class TrainConfig(BaseConfig):
         ).strip() + " --failslow-aware"
 
 
-def run_and_log_megatron(megatron_cmd_args, log_file_handle, log_file_dir, distributed_config):
+def run_and_log_megatron(megatron_cmd_args, log_file_handle, log_file_dir, distributed_config, detector_enabled=True):
     # Start the subprocess
     print(megatron_cmd_args)
     my_env = os.environ.copy()
     my_env['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
     my_env['OMP_NUM_THREADS'] = '1'
-    my_env['LD_PRELOAD'] = '/workspace/Greyhound/detector/build/libncclprobe.so'
-    my_env['CONTROL_PLANE_WHL_PATH'] = '/workspace/Greyhound/detector/dist/control_plane-1.0-py3-none-any.whl'
-    my_env['NCCLPROBE_LOG_PATH'] = log_file_dir
-    my_env['GLOBAL_CONTROLLER_LOG_PATH'] = log_file_dir
-    my_env['LOCAL_CONTROLLER_LOG_PATH'] = log_file_dir
+    if detector_enabled:
+        my_env['LD_PRELOAD'] = '/workspace/Greyhound/detector/build/libncclprobe.so'
+        my_env['CONTROL_PLANE_WHL_PATH'] = '/workspace/Greyhound/detector/dist/control_plane-1.0-py3-none-any.whl'
+        my_env['NCCLPROBE_LOG_PATH'] = log_file_dir
+        my_env['GLOBAL_CONTROLLER_LOG_PATH'] = log_file_dir
+        my_env['LOCAL_CONTROLLER_LOG_PATH'] = log_file_dir
+    else:
+        my_env.pop('LD_PRELOAD', None)
     process = subprocess.Popen(
         megatron_cmd_args,
         env=my_env,
@@ -148,6 +151,7 @@ def get_args():
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--master', type=str, default='127.0.0.1')
     parser.add_argument('--master-port', type=int, default=6000)
+    parser.add_argument('--disable-detector', action='store_true')
     return parser.parse_args()
 
 
@@ -235,7 +239,10 @@ def main():
         log_file.write(info_str)
         log_file.write(redis_logstr)
         log_file.flush()
-        return_code = run_and_log_megatron(run_args, log_file, log_file_dir, distributed_config)
+        return_code = run_and_log_megatron(
+            run_args, log_file, log_file_dir, distributed_config,
+            detector_enabled=not args.disable_detector,
+        )
 
     if redis_proc:
         redis_proc.terminate()
