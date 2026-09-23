@@ -96,7 +96,7 @@ class TrainConfig(BaseConfig):
 def run_and_log_megatron(megatron_cmd_args, log_file_handle, log_file_dir, distributed_config):
     # Start the subprocess
     print(megatron_cmd_args)
-    my_env = os.environ
+    my_env = os.environ.copy()
     my_env['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
     my_env['OMP_NUM_THREADS'] = '1'
     my_env['LD_PRELOAD'] = '/workspace/Greyhound/detector/build/libncclprobe.so'
@@ -104,35 +104,39 @@ def run_and_log_megatron(megatron_cmd_args, log_file_handle, log_file_dir, distr
     my_env['NCCLPROBE_LOG_PATH'] = log_file_dir
     my_env['GLOBAL_CONTROLLER_LOG_PATH'] = log_file_dir
     my_env['LOCAL_CONTROLLER_LOG_PATH'] = log_file_dir
-    process = subprocess.Popen(megatron_cmd_args, text=True)
+    process = subprocess.Popen(
+        megatron_cmd_args,
+        env=my_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
     iteration_time_pattern = re.compile(r'iteration \(ms\): ([\d.]+)')
     current_iteration_pattern = re.compile(r'iteration\s+(\d+)/')
     log_file_handle.write("Iteration, IterationTime(ms)\n")
-    output = None
-    # Read the output line by line
+    # Read and mirror the training output line by line.
     while True:
         try:
-            if output is not None:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                if output and ('[2024' in output):
-                    # Find the iteration time and current iteration
-                    iteration_time_match = iteration_time_pattern.search(output)
-                    current_iteration_match = current_iteration_pattern.search(output)
-                    if iteration_time_match and current_iteration_match:
-                        iteration_time = iteration_time_match.group(1)
-                        current_iteration = current_iteration_match.group(1)
-                        # Log the parsed information to the file
-                        log_entry = f"{current_iteration}, {iteration_time}\n"
-                        print(log_entry)
-                        log_file_handle.write(log_entry)
-                        log_file_handle.flush()  # Ensure it writes immediately
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if not output:
+                continue
+            print(output, end='', flush=True)
+            iteration_time_match = iteration_time_pattern.search(output)
+            current_iteration_match = current_iteration_pattern.search(output)
+            if iteration_time_match and current_iteration_match:
+                iteration_time = iteration_time_match.group(1)
+                current_iteration = current_iteration_match.group(1)
+                log_file_handle.write(f"{current_iteration}, {iteration_time}\n")
+                log_file_handle.flush()
         except KeyboardInterrupt:
             process.terminate()
             log_file_handle.write("Training terminated\n")
             log_file_handle.flush()
             break
+    return process.wait()
 
 
 
@@ -140,9 +144,10 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--logdir', type=str, default='/workspace/Greyhound/trainlog')
     parser.add_argument('--iter', type=int, default=10000)
-    # parser.add_argument('--nnodes', type=int, default=1)
-    # parser.add_argument('--rank', type=int, default=0)
-    # parser.add_argument('--master', type=str, default='localhost')
+    parser.add_argument('--nnodes', type=int, default=1)
+    parser.add_argument('--rank', type=int, default=0)
+    parser.add_argument('--master', type=str, default='127.0.0.1')
+    parser.add_argument('--master-port', type=int, default=6000)
     return parser.parse_args()
 
 
@@ -150,12 +155,12 @@ def main():
     os.chdir('./Megatron-LM/')
     args = get_args()
     log_file_dir, iter_1000 = args.logdir, args.iter
-    master = "localhost"  # os.getenv("MASTER_ADDR")
-    nnodes = 1  # int(os.getenv("WORLD_SIZE"))
-    rank = 0  # int(os.getenv("RANK"))
+    master = args.master
+    nnodes = args.nnodes
+    rank = args.rank
 
     # start redis
-    redis_cmd = ["redis-server", "--save", "\"\"", "--appendonly", "no", "--bind", f"{master}"]
+    redis_cmd = ["redis-server", "--save", "", "--appendonly", "no", "--bind", master, "--protected-mode", "no"]
     if rank == 0:
         redis_proc = subprocess.Popen(redis_cmd)
         redis_logstr = "Rank 0 starts redis: [" + " ".join(redis_cmd) + "]\n"
@@ -180,7 +185,7 @@ def main():
     
     log_file_dir += f"_rank{rank}"
     if not os.path.exists(log_file_dir):
-        os.mkdir(log_file_dir)
+        os.makedirs(log_file_dir, exist_ok=True)
     log_file_path = log_file_dir + f"/megatron_output_{rank}.log"
 
     tp = {1:1, 2:2, 4:2, 8:4}
@@ -202,7 +207,7 @@ def main():
     print(info_str)
 
     distributed_config = DistributedConfig(
-        nproc_per_node=num_gpus, nnodes=nnodes, node_rank=rank, master_addr=master, master_port=6000
+        nproc_per_node=num_gpus, nnodes=nnodes, node_rank=rank, master_addr=master, master_port=args.master_port
     )
     model_config = ModelConfig(
         tensor_model_parallel_size=tp[num_gpus], pipeline_model_parallel_size=pp[num_gpus], num_layers=64,
@@ -230,10 +235,12 @@ def main():
         log_file.write(info_str)
         log_file.write(redis_logstr)
         log_file.flush()
-        run_and_log_megatron(run_args, log_file, log_file_dir, distributed_config)
+        return_code = run_and_log_megatron(run_args, log_file, log_file_dir, distributed_config)
 
     if redis_proc:
         redis_proc.terminate()
+    if return_code != 0:
+        raise SystemExit(return_code)
 
 if __name__ == '__main__':
     main()
