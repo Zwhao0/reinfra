@@ -1,0 +1,6 @@
+.DS_Store
+
+# Experiment outputs stay on the machine that produced them.
+slow node detection/GREYHOUND/trainlog/
+slow node detection/GREYHOUND/detector/injection/*.pkl
+reproduction-data/

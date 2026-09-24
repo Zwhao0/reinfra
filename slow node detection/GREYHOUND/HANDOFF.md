@@ -14,13 +14,14 @@
 - 两台服务器代码根目录：`/home/test/weihao/slow node detection/GREYHOUND`
 - 实验原始日志：本机 `reproduction-data/greyhound-20260923/`
 - 操作与复现指南：`REPRODUCTION_ZH.md`
-- 固化版本：Git tag `v1`（“GREYHOUND 测试成功”）。
+- GitHub：`https://github.com/Zwhao0/infra`；固化版本：tag `v1`（“GREYHOUND 测试成功”）。
+- 同步范围：代码、配置和文档；`trainlog/`、注入生成的 `.pkl` 与实验中间结果留在产生它们的机器上。
 
 ## 下次开发从这里开始
 
 1. 先阅读 `REPRODUCTION_ZH.md`，其中有启动容器、单机/双机命令、日志位置和清理步骤。
 2. 在两台主机启动 `greyhound-ae` 容器后，再按文档执行训练或定位实验。
-3. 修改代码后：本机提交并推送 GitHub；服务器无外网时，用 Git bundle 从本机传入并在服务器工作树 fast-forward。
+3. 修改代码后：在本机 `infra` 提交并推送 GitHub；服务器无外网时，将本机提交中的 GREYHOUND 代码用 `git archive` 经 SSH 传到两机，再比对哈希。服务器的 GREYHOUND 子目录仍有独立的上游 Git 历史，不要将它直接与 `infra` 的 Git 历史合并。
 
 ## 注意
 
